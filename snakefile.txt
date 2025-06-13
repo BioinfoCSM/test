@@ -1,0 +1,209 @@
+#Config
+configfile : "config.yaml"
+
+
+#Common
+raw_dir = config["common"]["raw_dir"]
+work_dir = config["common"]["work_dir"]
+CSM = []
+with open (config["common"]["samples"], "r") as fr :
+  for line in fr :
+    line = line.strip ().split ("\t")[1]
+    CSM.append (line)
+CASE = []
+CTRL = []
+with open (config["common"]["contrasts"], "r") as fr : 
+  for line in fr : 
+    lis = line.strip ().split ("\t")[0:]
+    CASE.append (lis[0])
+    CTRL.append (lis[1])
+
+
+#Total
+rule all : 
+  input : 
+    expand (f"{work_dir}/fastqc/{{csm}}/{{csm}}_1_fastqc.html", csm = CSM),
+    expand (f"{work_dir}/fastqc/{{csm}}/{{csm}}_2_fastqc.html", csm = CSM),
+    expand (f"{work_dir}/ref/genome.hisat2.{{i}}.ht2", i = list (range (1, 9))),
+    expand (f"{work_dir}/DE_analysis/genes.counts.matrix.{{case}}_vs_{{ctrl}}.DESeq2.DE_results", case = CASE, ctrl = CTRL)
+
+#QC
+rule qc_fastqc : 
+  input :
+    r1 = f"{raw_dir}/{{sample}}_1.fastq.gz",
+    r2 = f"{raw_dir}/{{sample}}_2.fastq.gz"
+  output : 
+    r1_html = f"{work_dir}/fastqc/{{sample}}/{{sample}}_1_fastqc.html",
+    r2_html = f"{work_dir}/fastqc/{{sample}}/{{sample}}_2_fastqc.html"
+  params :
+    fastqc = config["qc"]["fastqc"],
+    thread = config["qc"]["thread"],
+    prefix = f"{work_dir}/fastqc/{{sample}}"
+  shell :
+    """
+    {params.fastqc} \
+    -f fastq \
+    -t {params.thread} \
+    {input.r1} \
+    {input.r2} \
+    -o {params.prefix}
+    """
+
+
+#Filter
+rule filter_fastp : 
+  input : 
+    r1 = f"{raw_dir}/{{sample}}_1.fastq.gz",
+    r2 = f"{raw_dir}/{{sample}}_2.fastq.gz"
+  output : 
+    r1 = f"{work_dir}/cleandata/{{sample}}/{{sample}}_1.fastq.gz",
+    r2 = f"{work_dir}/cleandata/{{sample}}/{{sample}}_2.fastq.gz",
+    report = f"{work_dir}/cleandata/{{sample}}/{{sample}}.html",
+    json = f"{work_dir}/cleandata/{{sample}}/{{sample}}.json"
+  params : 
+    fastp = config["filter"]["fastp"],
+    thread = config["filter"]["thread"] 
+  shell :  
+    """
+    {params.fastp} -w {params.thread} \
+        -i {input.r1} \
+        -I {input.r2} \
+        -o {output.r1} \
+        -O {output.r2} \
+        -h {output.report} \
+        -j {output.json}
+    """
+
+
+#Alignment
+rule index : 
+  input : 
+    genome = config["index"]["genome"]
+  output : 
+    expand (f"{work_dir}/ref/genome.hisat2.{{i}}.ht2", i = list (range (1, 9)))
+  params : 
+    hisat2_build = config["index"]["hisat2_build"],
+    thread = config["index"]["thread"],
+    prefix = f"{work_dir}/ref/genome.hisat2"
+  priority : 10
+  shell : 
+    """
+    {params.hisat2_build} -p {params.thread} {input.genome} {params.prefix}
+    """
+
+rule align_hisat2 : 
+  input : 
+    r1 = f"{work_dir}/cleandata/{{sample}}/{{sample}}_1.fastq.gz", 
+    r2 = f"{work_dir}/cleandata/{{sample}}/{{sample}}_2.fastq.gz", 
+    index = expand (f"{work_dir}/ref/genome.hisat2.{{i}}.ht2", i = list (range (1, 9)))
+  output : 
+    sam = temp (f"{work_dir}/alignment/{{sample}}/{{sample}}.sam"),
+    log = f"{work_dir}/alignment/{{sample}}/{{sample}}.log"
+  params : 
+    hisat2 = config["alignment"]["hisat2"],
+    strandness = config["alignment"]["strandness"],
+    prefix = f"{work_dir}/ref/genome.hisat2",
+    thread = config["alignment"]["thread"]
+  shell : 
+    """
+    {params.hisat2} -p {params.thread} \
+        -x {params.prefix} \
+        -1 {input.r1} \
+        -2 {input.r2} \
+        --new-summary --rna-strandness {params.strandness} \
+        -S {output.sam} 2> {output.log}
+    """
+
+rule sam2bam : 
+  input : 
+    sam = f"{work_dir}/alignment/{{sample}}/{{sample}}.sam"
+  output : 
+    bam = protected (f"{work_dir}/alignment/{{sample}}/{{sample}}.bam")
+  params : 
+    samtools = config["sam2bam"]["samtools"],
+    thread = config["sam2bam"]["thread"]
+  shell : 
+    """
+    {params.samtools} sort \
+    -@ {params.thread} \
+    -o {output.bam} \
+    {input.sam} && \
+    {params.samtools} index \
+    -@ {params.thread} {output.bam}
+    """
+
+
+#Quantification
+rule quanti_featurecounts : 
+  input : 
+    bam = f"{work_dir}/alignment/{{sample}}/{{sample}}.bam",
+    gtf = config["quanti"]["gtf"]
+  output : 
+    expr = f"{work_dir}/quantification/{{sample}}/{{sample}}.count",
+    log = f"{work_dir}/quantification/{{sample}}/{{sample}}.log" 
+  params : 
+    Rscript = config["quanti"]["Rscript"],
+    featureCounts = config["quanti"]["featureCounts"],
+    strandness = config["quanti"]["strandness"],
+    prefix = f"{work_dir}/quantification/{{sample}}/{{sample}}"
+  shell : 
+    """
+    {params.Rscript} {params.featureCounts} \
+        -b {input.bam} \
+        -g {input.gtf} \
+        -s {params.strandness} \
+        -o {params.prefix}
+    """
+
+rule merge_count : 
+  input : 
+    expr = expand (f"{work_dir}/quantification/{{sample}}/{{sample}}.count", sample = CSM)
+  output : 
+    expr_merge_count = f"{work_dir}/quantification/genes.counts.matrix",
+    expr_merge_tpm = f"{work_dir}/quantification/genes.TMM.TPM.matrix" 
+  params : 
+    expr_files = f"{work_dir}/quantification/quanti_files.txt",
+    perl = config["quanti"]["perl"],
+    abundance_estimates_to_matrix = config["quanti"]["abundance_estimates_to_matrix"],
+    prefix = f"{work_dir}/quantification/genes"
+  shell : 
+    """
+    ls {input.expr} > {params.expr_files} && \
+    {params.perl}\
+    {params.abundance_estimates_to_matrix} \
+        --est_method featureCounts \
+        --out_prefix {params.prefix} \
+        --quant_files {params.expr_files} && \
+    sed -i '1s/^/gene_id/g' {output.expr_merge_count} && \
+    sed -i '1s/^/gene_id/g' {output.expr_merge_tpm}
+    """
+
+
+#Diff
+rule diff_DESeq2 : 
+  input : 
+    expr_merge_count = f"{work_dir}/quantification/genes.counts.matrix",
+    samples = config["common"]["samples"], 
+    contrasts = config["common"]["contrasts"]
+  output : 
+    de_result = f"{work_dir}/DE_analysis/genes.counts.matrix.{{case}}_vs_{{ctrl}}.DESeq2.DE_results"
+  params : 
+    perl = config["diff"]["perl"],
+    run_DE_analysis = config["diff"]["run_DE_analysis"],
+    method = config["diff"]["method"],
+    outdir = f"{work_dir}/DE_analysis"
+  shell : 
+    """
+    {params.perl} \
+    {params.run_DE_analysis} \
+        --matrix {input.expr_merge_count} \
+        --method {params.method} \
+        --samples_file {input.samples} \
+        --contrasts {input.contrasts} \
+        --output {params.outdir}
+    """
+
+
+
+
+
